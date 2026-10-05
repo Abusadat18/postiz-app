@@ -114,6 +114,9 @@ jobs:
             git fetch origin
             git reset --hard origin/main
 
+            # The other compose files in that repo are experiments; only this one is deployed.
+            export COMPOSE_FILE=docker-compose.prod.full.yaml
+
             # The job token expires with the job, so keep it out of ~/.docker/config.json.
             export DOCKER_CONFIG="$(mktemp -d)"
             trap 'rm -rf "$DOCKER_CONFIG"' EXIT
