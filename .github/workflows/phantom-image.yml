@@ -17,10 +17,6 @@ on:
       - 'phantom-v*'
   workflow_dispatch:
 
-concurrency:
-  group: phantom-image-${{ github.ref }}
-  cancel-in-progress: true
-
 permissions:
   contents: read
   packages: write
@@ -28,6 +24,10 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-latest
+    # Job-level, not workflow-level: a newer push cancels a stale build, never a running deploy.
+    concurrency:
+      group: phantom-image-${{ github.ref }}
+      cancel-in-progress: true
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -77,3 +77,62 @@ jobs:
           cache-to: type=gha,mode=max
           provenance: false
           sbom: false
+
+  deploy:
+    needs: build
+    if: github.ref == 'refs/heads/phantom/main'
+    runs-on: ubuntu-latest
+    # This token is sent to the VPS for the image pull, so give it nothing more.
+    permissions:
+      packages: read
+    concurrency:
+      group: deploy-postiz
+      cancel-in-progress: false
+    steps:
+      - name: Image tag
+        id: tag
+        # Same sha-<short> tag that metadata-action pushed in the build job.
+        run: echo "value=sha-${GITHUB_SHA::7}" >> "$GITHUB_OUTPUT"
+
+      - name: Deploy Postiz to EC2
+        uses: appleboy/ssh-action@v1.2.0
+        env:
+          GHCR_USER: ${{ github.actor }}
+          GHCR_TOKEN: ${{ github.token }}
+          PHANTOM_POSTIZ_TAG: ${{ steps.tag.outputs.value }}
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USER }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          envs: GHCR_USER,GHCR_TOKEN,PHANTOM_POSTIZ_TAG
+          command_timeout: 20m
+          script: |
+            set -e
+            # Compose lives in its own repo (Abusadat18/Postiz-Setup). .env is untracked, so the
+            # reset leaves it alone; the exported PHANTOM_POSTIZ_TAG overrides any pin in it.
+            cd /opt/Postiz-Setup
+            git fetch origin
+            git reset --hard origin/main
+
+            # The job token expires with the job, so keep it out of ~/.docker/config.json.
+            export DOCKER_CONFIG="$(mktemp -d)"
+            trap 'rm -rf "$DOCKER_CONFIG"' EXIT
+            echo "$GHCR_TOKEN" | docker login ghcr.io -u "$GHCR_USER" --password-stdin
+
+            docker compose config --quiet
+            docker compose pull postiz
+            docker compose up -d --no-deps postiz
+
+            # start_period is 120s and the check runs every 30s, so allow 8 minutes.
+            for i in $(seq 1 96); do
+              status=$(docker inspect -f '{{.State.Health.Status}}' postiz 2>/dev/null || echo missing)
+              [ "$status" = healthy ] && break
+              sleep 5
+            done
+            if [ "$status" != healthy ]; then
+              echo "postiz is $status after 8 minutes"
+              docker compose logs --tail 100 postiz
+              exit 1
+            fi
+
+            docker image prune -f
