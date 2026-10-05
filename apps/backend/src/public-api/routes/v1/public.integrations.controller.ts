@@ -119,8 +119,20 @@ export class PublicIntegrationsController {
   ) {
     Sentry.metrics.count('public_api-request', 1);
     const posts = await this._postsService.getPosts(org.id, query);
+
+    // PhantomPulse: tells "the platform changed its API" apart from "the
+    // platform rejected this post", without exposing the raw error
+    const contractChanged =
+      await this._postsService.getContractChangedPlatforms(
+        org.id,
+        posts.filter((p) => p.state === 'ERROR').map((p) => p.id)
+      );
+
     return {
-      posts,
+      posts: posts.map((p) => ({
+        ...p,
+        contractChangedPlatform: contractChanged[p.id] ?? null,
+      })),
       // comments,
     };
   }

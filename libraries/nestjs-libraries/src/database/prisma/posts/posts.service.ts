@@ -46,7 +46,11 @@ import {
 import { AnalyticsData } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
-import { RefreshToken } from '@gitroom/nestjs-libraries/integrations/social.abstract';
+import {
+  ContractChanged,
+  RefreshToken,
+  contractChangedIdentifier,
+} from '@gitroom/nestjs-libraries/integrations/social.abstract';
 import { RefreshIntegrationService } from '@gitroom/nestjs-libraries/integrations/refresh.integration.service';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
 import { stripLinks } from '@gitroom/helpers/utils/strip.links';
@@ -267,6 +271,11 @@ export class PostsService {
       if (e instanceof RefreshToken) {
         return this.checkPostAnalytics(orgId, postId, date, true);
       }
+      // PhantomPulse: an API change must reach the caller, not look like
+      // "no analytics" (see ContractChangedExceptionFilter)
+      if (e instanceof ContractChanged) {
+        throw e;
+      }
     }
 
     return [];
@@ -367,6 +376,25 @@ export class PostsService {
 
   async getPosts(orgId: string, query: GetPostsDto) {
     return this._postRepository.getPosts(orgId, query);
+  }
+
+  /**
+   * PhantomPulse: for each failed post among `ids` that failed because the
+   * platform changed its API, the provider identifier that reported it.
+   */
+  async getContractChangedPlatforms(
+    orgId: string,
+    ids: string[]
+  ): Promise<Record<string, string>> {
+    if (!ids.length) {
+      return {};
+    }
+
+    const failed = await this._postRepository.getFailedPostsErrors(orgId, ids);
+    return failed.reduce((all, post) => {
+      const identifier = contractChangedIdentifier(post.error);
+      return identifier ? { ...all, [post.id]: identifier } : all;
+    }, {} as Record<string, string>);
   }
 
   async getPostsMinified(orgId: string, query: GetPostsDto) {

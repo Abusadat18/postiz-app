@@ -69,7 +69,12 @@ export class InstagramStandaloneProvider
     status: number
   ):
     | {
-        type: 'refresh-token' | 'bad-body' | 'retry' | 'disconnect';
+        type:
+          | 'refresh-token'
+          | 'bad-body'
+          | 'retry'
+          | 'disconnect'
+          | 'contract-changed';
         value: string;
       }
     | undefined {

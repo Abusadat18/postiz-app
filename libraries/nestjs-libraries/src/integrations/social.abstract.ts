@@ -110,6 +110,48 @@ export class BadBody extends ApplicationFailure {
   }
 }
 
+// PhantomPulse: the platform answered, but not in the shape the provider
+// expects - a deprecated endpoint or API version, or a field we read is gone.
+// It is a BadBody on purpose: running post workflows only know 'bad_body', and
+// workflows cannot change, so the post fails exactly like any rejected post.
+// The marker lets PhantomPulse tell "the platform changed its API" apart from
+// "the platform rejected this content" and put the platform into maintenance.
+// It goes into `details` because Temporal serializes those into the stored
+// post error, while an Error's message is not serialized.
+export const PLATFORM_CONTRACT_CHANGED = 'platform_contract_changed';
+
+export class ContractChanged extends BadBody {
+  constructor(identifier: string, json: string, body: BodyInit, message = '') {
+    super(
+      identifier,
+      json,
+      body,
+      `[${PLATFORM_CONTRACT_CHANGED}:${identifier}] ${message}`
+    );
+    (this.details as unknown[]).push({
+      [PLATFORM_CONTRACT_CHANGED]: identifier,
+    });
+  }
+}
+
+/**
+ * The provider identifier of a contract-changed failure, or null. Accepts the
+ * live error or its stored form (the JSON saved in a post's `error`).
+ */
+export function contractChangedIdentifier(err: unknown): string | null {
+  if (err instanceof ContractChanged) {
+    const marker = (err.details || []).find(
+      (d: any) => d && typeof d === 'object' && PLATFORM_CONTRACT_CHANGED in d
+    ) as Record<string, string> | undefined;
+    return marker?.[PLATFORM_CONTRACT_CHANGED] || null;
+  }
+
+  const text = typeof err === 'string' ? err : safeStringify(err ?? '');
+  // The details marker in plain or escaped JSON, or the message prefix.
+  const match = text.match(/platform_contract_changed\\?"?:\\?"?([a-z0-9-]+)/);
+  return match ? match[1] : null;
+}
+
 export class NotEnoughScopes {
   constructor(
     public message = 'Not enough scopes, when choosing a provider, please add all the scopes'
@@ -139,11 +181,50 @@ export abstract class SocialAbstract {
     status: number
   ):
     | {
-        type: 'refresh-token' | 'bad-body' | 'retry' | 'disconnect';
+        type:
+          | 'refresh-token'
+          | 'bad-body'
+          | 'retry'
+          | 'disconnect'
+          | 'contract-changed';
         value: string;
       }
     | undefined {
     return undefined;
+  }
+
+  /**
+   * PhantomPulse: throws ContractChanged when a platform response is missing a
+   * field the provider reads. Call it right after parsing a response, before
+   * using it, so an API change fails loudly instead of posting with undefined
+   * values. Paths are dotted, e.g. 'data.id'; a '[]' segment means "the first
+   * element of this array".
+   */
+  protected requireFields(response: any, paths: string[], context: string) {
+    const missing = paths.filter((path) => {
+      let current = response;
+      for (const segment of path.split('.')) {
+        current =
+          segment === '[]'
+            ? Array.isArray(current)
+              ? current[0]
+              : undefined
+            : current?.[segment];
+        if (current === undefined || current === null) {
+          return true;
+        }
+      }
+      return false;
+    });
+
+    if (missing.length) {
+      throw new ContractChanged(
+        this.identifier,
+        truncateForTemporal(response, MAX_FAILURE_FIELD),
+        '{}',
+        `${context}: the response is missing ${missing.join(', ')}`
+      );
+    }
   }
 
   /**
@@ -466,6 +547,15 @@ export abstract class SocialAbstract {
         throw new Disconnect(identifier, json, '{}', handleError?.value);
       }
 
+      if (handleError?.type === 'contract-changed') {
+        throw new ContractChanged(
+          identifier || this.identifier,
+          json,
+          '{}',
+          handleError?.value
+        );
+      }
+
       if (
         (status === 401 &&
           (handleError?.type === 'refresh-token' || !handleError)) ||
@@ -521,6 +611,14 @@ export abstract class SocialAbstract {
       if (value.type === 'disconnect') {
         throw new Disconnect(
           '',
+          safeStringify(globalErr),
+          {} as any,
+          value.value || ''
+        );
+      }
+      if (value.type === 'contract-changed') {
+        throw new ContractChanged(
+          this.identifier,
           safeStringify(globalErr),
           {} as any,
           value.value || ''
@@ -608,6 +706,15 @@ export abstract class SocialAbstract {
     if (handleError?.type === 'disconnect') {
       throw new Disconnect(
         identifier,
+        json,
+        options.body!,
+        handleError?.value
+      );
+    }
+
+    if (handleError?.type === 'contract-changed') {
+      throw new ContractChanged(
+        identifier || this.identifier,
         json,
         options.body!,
         handleError?.value

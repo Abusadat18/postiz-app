@@ -104,10 +104,28 @@ export class InstagramProvider
     status: number
   ):
     | {
-        type: 'refresh-token' | 'bad-body' | 'retry' | 'disconnect';
+        type:
+          | 'refresh-token'
+          | 'bad-body'
+          | 'retry'
+          | 'disconnect'
+          | 'contract-changed';
         value: string;
       }
     | undefined {
+    // PhantomPulse: the Graph API no longer accepts the call as we make it -
+    // (#12) deprecated call, (#2635) deprecated API version, or a field we
+    // request was removed. Our integration must change, not the user's post.
+    if (
+      /"code":\s*(12|2635)\b/.test(body) ||
+      body.indexOf('nonexisting field') > -1
+    ) {
+      return {
+        type: 'contract-changed' as const,
+        value: 'Instagram changed its API, the integration needs an update',
+      };
+    }
+
     if (body.indexOf('An unknown error occurred') > -1) {
       return {
         type: 'retry' as const,
@@ -642,7 +660,7 @@ export class InstagramProvider
     checkToken: string,
     type: string
   ): Promise<string> {
-    const { status_code, status } = await (
+    const response = await (
       await this.fetch(
         `https://${type}/${META_GRAPH_API_VERSION}/${containerId}?access_token=${checkToken}&fields=status_code,status`,
         undefined,
@@ -651,6 +669,10 @@ export class InstagramProvider
         true
       )
     ).json();
+    // Without status_code the workflow would poll a container that never
+    // resolves, so a missing field is reported as an API change right away.
+    this.requireFields(response, ['status_code'], 'Instagram container status');
+    const { status_code, status } = response;
 
     if (status_code === 'ERROR' || status_code === 'EXPIRED') {
       const handleError = this.handleErrors(status || '', 200);

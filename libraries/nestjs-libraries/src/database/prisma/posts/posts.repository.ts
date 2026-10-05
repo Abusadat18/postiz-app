@@ -1110,6 +1110,24 @@ export class PostsRepository {
     });
   }
 
+  // PhantomPulse: raw errors of failed posts, read only to derive whether the
+  // platform changed its API (never returned as they are - they can hold the
+  // request body sent to the platform)
+  getFailedPostsErrors(orgId: string, ids: string[]) {
+    return this._post.model.post.findMany({
+      where: {
+        id: { in: ids },
+        organizationId: orgId,
+        state: State.ERROR,
+        deletedAt: null,
+      },
+      select: {
+        id: true,
+        error: true,
+      },
+    });
+  }
+
   async getPostsSince(orgId: string, since: string) {
     return this._post.model.post.findMany({
       where: {

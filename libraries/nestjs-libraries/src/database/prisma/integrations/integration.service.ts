@@ -17,6 +17,7 @@ import dayjs from 'dayjs';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import {
+  ContractChanged,
   NotEnoughScopes,
   RefreshToken,
 } from '@gitroom/nestjs-libraries/integrations/social.abstract';
@@ -514,6 +515,11 @@ export class IntegrationService {
       } catch (e) {
         if (e instanceof RefreshToken) {
           return this.checkAnalytics(org, integration, date, true);
+        }
+        // PhantomPulse: an API change must reach the caller, not look like
+        // "no analytics" (see ContractChangedExceptionFilter)
+        if (e instanceof ContractChanged) {
+          throw e;
         }
       }
     }

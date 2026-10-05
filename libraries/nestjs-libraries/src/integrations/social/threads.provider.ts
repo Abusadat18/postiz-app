@@ -40,11 +40,24 @@ export class ThreadsProvider extends SocialAbstract implements SocialProvider {
 
   override handleErrors(body: string):
     | {
-        type: 'refresh-token' | 'bad-body' | 'retry';
+        type: 'refresh-token' | 'bad-body' | 'retry' | 'contract-changed';
         value: string;
       }
     | undefined {
     console.log(body);
+    // PhantomPulse: the Graph API no longer accepts the call as we make it -
+    // (#12) deprecated call, (#2635) deprecated API version, or a field we
+    // request was removed. Our integration must change, not the user's post.
+    if (
+      /"code":\s*(12|2635)\b/.test(body) ||
+      body.indexOf('nonexisting field') > -1
+    ) {
+      return {
+        type: 'contract-changed' as const,
+        value: 'Threads changed its API, the integration needs an update',
+      };
+    }
+
     if (body.includes('Error validating access token')) {
       return { type: 'refresh-token', value: 'Threads access token expired' };
     }
