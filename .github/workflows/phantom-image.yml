@@ -111,6 +111,13 @@ jobs:
             # Compose lives in its own repo (Abusadat18/Postiz-Setup). .env is untracked, so the
             # reset leaves it alone; the exported PHANTOM_POSTIZ_TAG overrides any pin in it.
             cd /opt/Postiz-Setup
+            # Secrets belong in .env; an edit to a tracked file on the VPS would be wiped by the
+            # reset below. Exit status 128 (git error) also stops the deploy here.
+            if ! git diff --quiet HEAD --; then
+              echo "Local edits in /opt/Postiz-Setup would be lost by the reset. Move them to .env or commit them:"
+              git status --short
+              exit 1
+            fi
             git fetch origin
             git reset --hard origin/main
 
