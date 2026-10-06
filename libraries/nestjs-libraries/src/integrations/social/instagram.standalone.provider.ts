@@ -278,4 +278,74 @@ export class InstagramStandaloneProvider
       'graph.instagram.com'
     );
   }
+
+  // PhantomPulse: same Graph shapes as Instagram, on graph.instagram.com.
+  async accountInsights(id: string, accessToken: string, days: number) {
+    return instagramProvider.accountInsights(
+      id,
+      accessToken,
+      days,
+      'graph.instagram.com'
+    );
+  }
+
+  async postInsights(
+    integrationId: string,
+    accessToken: string,
+    postId: string
+  ) {
+    return instagramProvider.postInsights(
+      integrationId,
+      accessToken,
+      postId,
+      'graph.instagram.com'
+    );
+  }
+
+  async postComments(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    cursor?: string
+  ) {
+    return instagramProvider.postComments(
+      integrationId,
+      accessToken,
+      postId,
+      cursor,
+      'graph.instagram.com'
+    );
+  }
+
+  async replyComment(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    commentId: string,
+    message: string
+  ) {
+    return instagramProvider.replyComment(
+      integrationId,
+      accessToken,
+      postId,
+      commentId,
+      message,
+      'graph.instagram.com'
+    );
+  }
+
+  async hideComment(
+    integrationId: string,
+    accessToken: string,
+    commentId: string,
+    hidden: boolean
+  ) {
+    return instagramProvider.hideComment(
+      integrationId,
+      accessToken,
+      commentId,
+      hidden,
+      'graph.instagram.com'
+    );
+  }
 }

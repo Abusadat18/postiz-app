@@ -1,4 +1,5 @@
 import { timer } from '@gitroom/helpers/utils/timer';
+import dayjs from 'dayjs';
 import { Integration } from '@prisma/client';
 import {
   AuthTokenDetails,
@@ -191,6 +192,35 @@ export abstract class SocialAbstract {
       }
     | undefined {
     return undefined;
+  }
+
+  /**
+   * PhantomPulse: the requested window ending now, and the same-length window
+   * just before it, as unix seconds. accountInsights compares the two.
+   */
+  protected insightWindows(days: number) {
+    const span = Math.min(Math.max(Math.round(days) || 30, 1), 90);
+    const until = dayjs().endOf('day');
+    const since = until.subtract(span, 'day');
+    return {
+      current: { since: since.unix(), until: until.unix() },
+      previous: {
+        since: since.subtract(span, 'day').unix(),
+        until: since.unix(),
+      },
+    };
+  }
+
+  /** PhantomPulse: sums each series into one total per metric. */
+  protected sumSeries(
+    series: { metric: string; points: { value: number }[] }[]
+  ): Record<string, number> {
+    return series.reduce((all, s) => {
+      all[s.metric] =
+        (all[s.metric] || 0) +
+        s.points.reduce((sum, p) => sum + (Number(p.value) || 0), 0);
+      return all;
+    }, {} as Record<string, number>);
   }
 
   /**

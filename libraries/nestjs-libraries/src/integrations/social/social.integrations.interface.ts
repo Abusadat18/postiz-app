@@ -34,6 +34,37 @@ export interface IAuthenticator {
     postId: string,
     fromDate: number,
   ): Promise<AnalyticsData[]>;
+  // PhantomPulse: detailed analytics and comment management. Optional, like
+  // analytics/postAnalytics; generic code checks for the function before calling.
+  accountInsights?(
+    id: string,
+    accessToken: string,
+    days: number
+  ): Promise<AccountInsights>;
+  postInsights?(
+    integrationId: string,
+    accessToken: string,
+    postId: string
+  ): Promise<PostInsights>;
+  postComments?(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    cursor?: string
+  ): Promise<CommentsPage>;
+  replyComment?(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string }>;
+  hideComment?(
+    integrationId: string,
+    accessToken: string,
+    commentId: string,
+    hidden: boolean
+  ): Promise<void>;
   resolveReleaseId?(
     accessToken: string,
     releaseId: string,
@@ -61,6 +92,49 @@ export interface AnalyticsData {
   percentageChange: number;
 }
 
+
+// PhantomPulse: metric keys are snake_case and shared across providers where
+// the meaning matches (impressions, reach, views, likes, comments, shares,
+// saves, clicks, engagement, follows...), so callers can compare platforms.
+export type InsightPoint = { date: string; value: number };
+
+export type AccountInsights = {
+  series: { metric: string; points: InsightPoint[] }[];
+  // Totals over the requested window and over the same-length window just
+  // before it, so callers compute a real change instead of a fixed number.
+  totals: Record<string, number>;
+  previousTotals: Record<string, number>;
+  // e.g. { country: [{ key: 'AE', value: 120 }], age_gender: [...] }
+  demographics: Record<string, { key: string; value: number }[]>;
+};
+
+export type PostInsights = {
+  metrics: Record<string, number>;
+  // e.g. { reactions: { like: 10, love: 2 }, clicks: { link_clicks: 4 } }
+  breakdowns: Record<string, Record<string, number>>;
+};
+
+export type SocialComment = {
+  id: string;
+  parentId: string | null;
+  message: string;
+  authorId: string | null;
+  // Null when the platform withholds commenter details from the app.
+  authorName: string | null;
+  authorPicture: string | null;
+  createdAt: string;
+  likeCount: number;
+  replyCount: number;
+  hidden: boolean;
+  canReply: boolean;
+  canHide: boolean;
+};
+
+export type CommentsPage = {
+  comments: SocialComment[];
+  nextCursor: string | null;
+  total: number | null;
+};
 
 export type GenerateAuthUrlResponse = {
   url: string;

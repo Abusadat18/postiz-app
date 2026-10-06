@@ -25,6 +25,10 @@ import { PostsService } from '@gitroom/nestjs-libraries/database/prisma/posts/po
 import { FileInterceptor } from '@nestjs/platform-express';
 import { MediaService } from '@gitroom/nestjs-libraries/database/prisma/media/media.service';
 import { GetPostsDto } from '@gitroom/nestjs-libraries/dtos/posts/get.posts.dto';
+import {
+  HideCommentDto,
+  ReplyCommentDto,
+} from '@gitroom/nestjs-libraries/dtos/posts/comment.dto';
 import { ChangePostStatusDto } from '@gitroom/nestjs-libraries/dtos/posts/change.post.status.dto';
 import { UpdatePostSettingsDto } from '@gitroom/nestjs-libraries/dtos/posts/update.post.settings.dto';
 import {
@@ -596,6 +600,89 @@ export class PublicIntegrationsController {
   ) {
     Sentry.metrics.count('public_api-request', 1);
     return this._integrationService.checkAnalytics(org, integration, date);
+  }
+
+  // ── PhantomPulse: detailed analytics and comments ─────────────────────────
+
+  @Get('/analytics/:integration/insights')
+  async getAccountInsights(
+    @GetOrgFromRequest() org: Organization,
+    @Param('integration') integration: string,
+    @Query('days') days: string
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this.orNotAvailable(
+      await this._integrationService.accountInsights(
+        org,
+        integration,
+        +days || 30
+      )
+    );
+  }
+
+  @Get('/posts/:id/insights')
+  async getPostInsights(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this.orNotAvailable(
+      await this._postsService.getPostInsights(org.id, id)
+    );
+  }
+
+  @Get('/posts/:id/comments')
+  async getPostComments(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Query('cursor') cursor?: string
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this.orNotAvailable(
+      await this._postsService.getPostComments(org.id, id, cursor || undefined)
+    );
+  }
+
+  @Post('/posts/:id/comments/:commentId/reply')
+  async replyToComment(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Param('commentId') commentId: string,
+    @Body() body: ReplyCommentDto
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this.orNotAvailable(
+      await this._postsService.replyToComment(
+        org.id,
+        id,
+        commentId,
+        body.message
+      )
+    );
+  }
+
+  @Post('/posts/:id/comments/:commentId/hide')
+  async hideComment(
+    @GetOrgFromRequest() org: Organization,
+    @Param('id') id: string,
+    @Param('commentId') commentId: string,
+    @Body() body: HideCommentDto
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this.orNotAvailable(
+      await this._postsService.hideComment(org.id, id, commentId, body.hidden)
+    );
+  }
+
+  /** Null from the services means "not published" or "the platform has no such feature". */
+  private orNotAvailable<T>(value: T | null): T {
+    if (value === null) {
+      throw new HttpException(
+        'Not available: the post is not published, or the platform does not support this',
+        404
+      );
+    }
+    return value;
   }
 
   @Get('/analytics/post/:postId')

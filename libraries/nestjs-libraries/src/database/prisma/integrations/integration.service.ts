@@ -8,6 +8,7 @@ import {
 import { IntegrationRepository } from '@gitroom/nestjs-libraries/database/prisma/integrations/integration.repository';
 import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integration.manager';
 import {
+  AccountInsights,
   AnalyticsData,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
@@ -442,6 +443,81 @@ export class IntegrationService {
     });
 
     return { success: true };
+  }
+
+  /**
+   * PhantomPulse: detailed account insights (series, totals against the
+   * previous period, demographics). Null when the channel has no provider
+   * support. Cached for an hour per channel and window, like checkAnalytics.
+   */
+  async accountInsights(
+    org: Organization,
+    integration: string,
+    days: number,
+    forceRefresh = false
+  ): Promise<AccountInsights | null> {
+    const getIntegration = await this.getIntegrationById(org.id, integration);
+    if (!getIntegration) {
+      throw new Error('Invalid integration');
+    }
+    if (getIntegration.type !== 'social') {
+      return null;
+    }
+
+    const integrationProvider = this._integrationManager.getSocialIntegration(
+      getIntegration.providerIdentifier
+    );
+    if (!integrationProvider.accountInsights) {
+      return null;
+    }
+
+    if (
+      dayjs(getIntegration.tokenExpiration).isBefore(dayjs()) ||
+      forceRefresh
+    ) {
+      const data = await this._refreshIntegrationService.refresh(
+        getIntegration
+      );
+      if (!data) {
+        return null;
+      }
+      if (!data.accessToken) {
+        await this.disconnectChannel(org.id, getIntegration);
+        return null;
+      }
+      getIntegration.token = data.accessToken;
+      if (integrationProvider.refreshWait) {
+        await timer(10000);
+      }
+    }
+
+    const cacheKey = `insights:${org.id}:${integration}:${days}`;
+    const cached = await ioRedis.get(cacheKey);
+    if (cached) {
+      return JSON.parse(cached);
+    }
+
+    try {
+      const insights = await integrationProvider.accountInsights(
+        getIntegration.internalId,
+        getIntegration.token,
+        days
+      );
+      await ioRedis.set(
+        cacheKey,
+        JSON.stringify(insights),
+        'EX',
+        !process.env.NODE_ENV || process.env.NODE_ENV === 'development'
+          ? 1
+          : 3600
+      );
+      return insights;
+    } catch (e) {
+      if (e instanceof RefreshToken && !forceRefresh) {
+        return this.accountInsights(org, integration, days, true);
+      }
+      throw e;
+    }
   }
 
   async checkAnalytics(

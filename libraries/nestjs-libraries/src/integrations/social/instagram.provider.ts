@@ -1,5 +1,9 @@
 import {
+  AccountInsights,
   AnalyticsData,
+  CommentsPage,
+  InsightPoint,
+  PostInsights,
   AuthTokenDetails,
   PendingCheckResponse,
   PostDetails,
@@ -21,6 +25,52 @@ import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorato
 import { META_GRAPH_API_VERSION } from '@gitroom/nestjs-libraries/integrations/social/facebook.provider';
 import { Tool } from '@gitroom/nestjs-libraries/integrations/tool.decorator';
 import { hasExtension } from '@gitroom/helpers/utils/has.extension';
+
+// PhantomPulse: account metrics that support metric_type=total_value.
+// `impressions` is gone (retired for all versions on 2025-04-21).
+const INSTAGRAM_ACCOUNT_TOTALS = [
+  'views',
+  'reach',
+  'accounts_engaged',
+  'total_interactions',
+  'likes',
+  'comments',
+  'shares',
+  'saves',
+  'replies',
+  'profile_links_taps',
+];
+
+// Media insight metrics per media_product_type. Unknown or newly retired
+// metrics make Meta reject the whole call, so postInsights falls back to
+// INSTAGRAM_MEDIA_BASE (the set postAnalytics has used in production).
+const INSTAGRAM_MEDIA_BASE = [
+  'views',
+  'reach',
+  'saved',
+  'likes',
+  'comments',
+  'shares',
+];
+const INSTAGRAM_MEDIA_METRICS: Record<string, string[]> = {
+  FEED: [...INSTAGRAM_MEDIA_BASE, 'total_interactions'],
+  REELS: [
+    ...INSTAGRAM_MEDIA_BASE,
+    'total_interactions',
+    'ig_reels_avg_watch_time',
+    'ig_reels_video_view_total_time',
+  ],
+  STORY: ['views', 'reach', 'replies', 'shares', 'total_interactions'],
+};
+
+const INSTAGRAM_MEDIA_KEYS: Record<string, string> = {
+  saved: 'saves',
+  ig_reels_avg_watch_time: 'avg_watch_time_ms',
+  ig_reels_video_view_total_time: 'total_watch_time_ms',
+};
+
+// Insights with since/until accept at most 30 days per call.
+const INSTAGRAM_MAX_RANGE_DAYS = 30;
 
 @Rules(
   "Instagram should have at least one attachment, if it's a story, it can have only one picture"
@@ -1347,5 +1397,251 @@ export class InstagramProvider
       console.error('Error fetching Instagram post analytics:', err);
       return [];
     }
+  }
+
+  // ── PhantomPulse: detailed analytics and comments ─────────────────────────
+
+  async accountInsights(
+    id: string,
+    token: string,
+    days: number,
+    type = 'graph.facebook.com'
+  ): Promise<AccountInsights> {
+    const [accessToken] = token.split('___');
+    const { current, previous } = this.insightWindows(days);
+
+    const [series, totals, previousTotals, demographics] = await Promise.all([
+      this.igReachSeries(id, accessToken, current.since, current.until, type),
+      this.igTotals(id, accessToken, current.since, current.until, type),
+      this.igTotals(id, accessToken, previous.since, previous.until, type),
+      this.igDemographics(id, accessToken, type),
+    ]);
+
+    return { series, totals, previousTotals, demographics };
+  }
+
+  /** Splits [since, until] into windows Instagram accepts in one call. */
+  private igRanges(since: number, until: number) {
+    const ranges: { since: number; until: number }[] = [];
+    const step = INSTAGRAM_MAX_RANGE_DAYS * 86400;
+    for (let start = since; start < until; start += step) {
+      ranges.push({ since: start, until: Math.min(start + step, until) });
+    }
+    return ranges;
+  }
+
+  private async igReachSeries(
+    id: string,
+    accessToken: string,
+    since: number,
+    until: number,
+    type: string
+  ) {
+    const points: InsightPoint[] = [];
+    for (const range of this.igRanges(since, until)) {
+      const response = await (
+        await this.fetch(
+          `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=reach&metric_type=time_series&period=day&since=${range.since}&until=${range.until}&access_token=${accessToken}`
+        )
+      ).json();
+      this.requireFields(response, ['data'], 'Instagram reach series');
+      for (const v of response.data?.[0]?.values || []) {
+        points.push({
+          date: dayjs(v.end_time).format('YYYY-MM-DD'),
+          value: Number(v.value) || 0,
+        });
+      }
+    }
+    return [{ metric: 'reach', points }];
+  }
+
+  private async igTotals(
+    id: string,
+    accessToken: string,
+    since: number,
+    until: number,
+    type: string
+  ) {
+    // Unique metrics (reach, accounts_engaged) are summed across 30-day
+    // windows, so beyond 30 days they are an upper bound, not a unique count.
+    const totals: Record<string, number> = {};
+    for (const range of this.igRanges(since, until)) {
+      const [response, follows] = await Promise.all([
+        this.fetch(
+          `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=${INSTAGRAM_ACCOUNT_TOTALS.join(
+            ','
+          )}&metric_type=total_value&period=day&since=${range.since}&until=${
+            range.until
+          }&access_token=${accessToken}`
+        ).then((r) => r.json()),
+        // Optional extra, so plain fetch: an account where Meta withholds it
+        // must not look like an API change.
+        fetch(
+          `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=follows_and_unfollows&metric_type=total_value&breakdown=follow_type&period=day&since=${range.since}&until=${range.until}&access_token=${accessToken}`
+        ).then((r) => r.json()),
+      ]);
+      this.requireFields(response, ['data'], 'Instagram account insights');
+
+      for (const metric of response.data as any[]) {
+        totals[metric.name] =
+          (totals[metric.name] || 0) + (Number(metric.total_value?.value) || 0);
+      }
+
+      for (const result of follows.data?.[0]?.total_value?.breakdowns?.[0]
+        ?.results || []) {
+        const key =
+          result.dimension_values?.[0] === 'FOLLOWER' ? 'follows' : 'unfollows';
+        totals[key] = (totals[key] || 0) + (Number(result.value) || 0);
+      }
+    }
+    return totals;
+  }
+
+  private async igDemographics(id: string, accessToken: string, type: string) {
+    // Plain fetch: Meta refuses demographics for accounts under 100 followers,
+    // which is a normal state, not an API change.
+    const breakdowns = ['country', 'city', 'age', 'gender'];
+    const results = await Promise.all(
+      breakdowns.map(async (breakdown) => {
+        const response = await (
+          await fetch(
+            `https://${type}/${META_GRAPH_API_VERSION}/${id}/insights?metric=follower_demographics&metric_type=total_value&period=lifetime&timeframe=last_30_days&breakdown=${breakdown}&access_token=${accessToken}`
+          )
+        ).json();
+        const values = (
+          response.data?.[0]?.total_value?.breakdowns?.[0]?.results || []
+        ).map((r: any) => ({
+          key: String(r.dimension_values?.[0] ?? ''),
+          value: Number(r.value) || 0,
+        }));
+        return [breakdown, values] as const;
+      })
+    );
+    return Object.fromEntries(results.filter(([, values]) => values.length));
+  }
+
+  async postInsights(
+    integrationId: string,
+    token: string,
+    postId: string,
+    type = 'graph.facebook.com'
+  ): Promise<PostInsights> {
+    const [accessToken] = token.split('___');
+    const media = await (
+      await this.fetch(
+        `https://${type}/${META_GRAPH_API_VERSION}/${postId}?fields=media_product_type,like_count,comments_count&access_token=${accessToken}`
+      )
+    ).json();
+    this.requireFields(media, ['media_product_type'], 'Instagram media');
+
+    const metrics =
+      INSTAGRAM_MEDIA_METRICS[media.media_product_type] || INSTAGRAM_MEDIA_BASE;
+    const url = (list: string[]) =>
+      `https://${type}/${META_GRAPH_API_VERSION}/${postId}/insights?metric=${list.join(
+        ','
+      )}&access_token=${accessToken}`;
+
+    let insights = await (await fetch(url(metrics))).json();
+    if (insights.error) {
+      insights = await (await this.fetch(url(INSTAGRAM_MEDIA_BASE))).json();
+    }
+    this.requireFields(insights, ['data'], 'Instagram media insights');
+
+    const result: PostInsights = { metrics: {}, breakdowns: {} };
+    for (const metric of insights.data as any[]) {
+      const value = metric.values?.[0]?.value ?? metric.total_value?.value;
+      if (value === undefined) continue;
+      result.metrics[INSTAGRAM_MEDIA_KEYS[metric.name] || metric.name] =
+        Number(value) || 0;
+    }
+    result.metrics.likes ??= media.like_count ?? 0;
+    result.metrics.comments ??= media.comments_count ?? 0;
+    return result;
+  }
+
+  async postComments(
+    integrationId: string,
+    token: string,
+    postId: string,
+    cursor?: string,
+    type = 'graph.facebook.com'
+  ): Promise<CommentsPage> {
+    const [accessToken] = token.split('___');
+    const fields =
+      'id,text,timestamp,username,from{id,username},like_count,hidden';
+    const response = await (
+      await this.fetch(
+        `https://${type}/${META_GRAPH_API_VERSION}/${postId}/comments?fields=${fields},replies{${fields}}&limit=50${
+          cursor ? `&after=${encodeURIComponent(cursor)}` : ''
+        }&access_token=${accessToken}`
+      )
+    ).json();
+    this.requireFields(response, ['data'], 'Instagram comments');
+
+    const toComment = (
+      c: any,
+      parentId: string | null,
+      replyCount: number
+    ) => ({
+      id: c.id,
+      parentId,
+      message: c.text ?? '',
+      authorId: c.from?.id ?? null,
+      authorName: c.username ?? c.from?.username ?? null,
+      authorPicture: null,
+      createdAt: dayjs(c.timestamp).toISOString(),
+      likeCount: c.like_count ?? 0,
+      replyCount,
+      hidden: !!c.hidden,
+      // Instagram allows one level of replies: a reply cannot be replied to.
+      canReply: parentId === null,
+      canHide: true,
+    });
+
+    return {
+      comments: (response.data as any[]).flatMap((c) => [
+        toComment(c, null, c.replies?.data?.length ?? 0),
+        ...(c.replies?.data || []).map((r: any) => toComment(r, c.id, 0)),
+      ]),
+      nextCursor: response.paging?.next
+        ? response.paging?.cursors?.after ?? null
+        : null,
+      total: null,
+    };
+  }
+
+  async replyComment(
+    integrationId: string,
+    token: string,
+    postId: string,
+    commentId: string,
+    message: string,
+    type = 'graph.facebook.com'
+  ): Promise<{ id: string }> {
+    const [accessToken] = token.split('___');
+    const response = await (
+      await this.fetch(
+        `https://${type}/${META_GRAPH_API_VERSION}/${commentId}/replies?message=${encodeURIComponent(
+          message
+        )}&access_token=${accessToken}`,
+        { method: 'POST' }
+      )
+    ).json();
+    this.requireFields(response, ['id'], 'Instagram comment reply');
+    return { id: response.id };
+  }
+
+  async hideComment(
+    integrationId: string,
+    token: string,
+    commentId: string,
+    hidden: boolean,
+    type = 'graph.facebook.com'
+  ): Promise<void> {
+    const [accessToken] = token.split('___');
+    await this.fetch(
+      `https://${type}/${META_GRAPH_API_VERSION}/${commentId}?hide=${hidden}&access_token=${accessToken}`,
+      { method: 'POST' }
+    );
   }
 }
