@@ -43,7 +43,12 @@ import {
   organizationId,
   postId as postIdSearchParam,
 } from '@gitroom/nestjs-libraries/temporal/temporal.search.attribute';
-import { AnalyticsData } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
+import {
+  AnalyticsData,
+  CommentsPage,
+  PostInsights,
+  SocialProvider,
+} from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { ioRedis } from '@gitroom/nestjs-libraries/redis/redis.service';
 import {
@@ -279,6 +284,156 @@ export class PostsService {
     }
 
     return [];
+  }
+
+  // ── PhantomPulse: post insights and comments ───────────────────────────────
+
+  /**
+   * Loads a published post with a usable token and its provider - the same
+   * steps checkPostAnalytics takes. Null when the post is not published.
+   */
+  private async publishedPostContext(
+    orgId: string,
+    postId: string,
+    forceRefresh: boolean
+  ): Promise<{
+    provider: SocialProvider;
+    integration: Integration;
+    releaseId: string;
+  } | null> {
+    const post = await this._postRepository.getPostById(postId, orgId);
+    if (!post?.releaseId || post.releaseId === 'missing') {
+      return null;
+    }
+
+    const provider = this._integrationManager.getSocialIntegration(
+      post.integration.providerIdentifier
+    );
+    const integration = post.integration!;
+
+    if (dayjs(integration.tokenExpiration).isBefore(dayjs()) || forceRefresh) {
+      const data = await this._refreshIntegrationService.refresh(integration);
+      if (!data) {
+        return null;
+      }
+      if (!data.accessToken) {
+        await this._integrationService.disconnectChannel(orgId, integration);
+        return null;
+      }
+      integration.token = data.accessToken;
+      if (provider.refreshWait) {
+        await timer(10000);
+      }
+    }
+
+    const { releaseId } = await this.resolveRelease(orgId, post);
+    return { provider, integration, releaseId };
+  }
+
+  /** Runs a provider call for a published post, refreshing the token once if the platform asks. */
+  private async withPublishedPost<T>(
+    orgId: string,
+    postId: string,
+    run: (context: {
+      provider: SocialProvider;
+      integration: Integration;
+      releaseId: string;
+    }) => Promise<T> | undefined
+  ): Promise<T | null> {
+    for (const forceRefresh of [false, true]) {
+      const context = await this.publishedPostContext(
+        orgId,
+        postId,
+        forceRefresh
+      );
+      if (!context) {
+        return null;
+      }
+      try {
+        return (await run(context)) ?? null;
+      } catch (e) {
+        if (e instanceof RefreshToken && !forceRefresh) {
+          continue;
+        }
+        throw e;
+      }
+    }
+    return null;
+  }
+
+  getPostInsights(orgId: string, postId: string): Promise<PostInsights | null> {
+    return this.withPublishedPost(
+      orgId,
+      postId,
+      ({ provider, integration, releaseId }) =>
+        provider.postInsights?.(
+          integration.internalId,
+          integration.token,
+          releaseId
+        )
+    );
+  }
+
+  getPostComments(
+    orgId: string,
+    postId: string,
+    cursor?: string
+  ): Promise<CommentsPage | null> {
+    return this.withPublishedPost(
+      orgId,
+      postId,
+      ({ provider, integration, releaseId }) =>
+        provider.postComments?.(
+          integration.internalId,
+          integration.token,
+          releaseId,
+          cursor
+        )
+    );
+  }
+
+  replyToComment(
+    orgId: string,
+    postId: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string } | null> {
+    return this.withPublishedPost(
+      orgId,
+      postId,
+      ({ provider, integration, releaseId }) =>
+        provider.replyComment?.(
+          integration.internalId,
+          integration.token,
+          releaseId,
+          commentId,
+          message
+        )
+    );
+  }
+
+  hideComment(
+    orgId: string,
+    postId: string,
+    commentId: string,
+    hidden: boolean
+  ): Promise<{ success: true } | null> {
+    return this.withPublishedPost(
+      orgId,
+      postId,
+      async ({ provider, integration }) => {
+        if (!provider.hideComment) {
+          return undefined;
+        }
+        await provider.hideComment(
+          integration.internalId,
+          integration.token,
+          commentId,
+          hidden
+        );
+        return { success: true as const };
+      }
+    );
   }
 
   async getStatistics(orgId: string, id: string) {

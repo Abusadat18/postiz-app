@@ -1,6 +1,11 @@
 import {
+  AccountInsights,
   AnalyticsData,
   AuthTokenDetails,
+  CommentsPage,
+  InsightPoint,
+  PostInsights,
+  SocialComment,
   PostDetails,
   PostResponse,
   SocialProvider,
@@ -12,6 +17,9 @@ import { Integration } from '@prisma/client';
 import { Plug } from '@gitroom/helpers/decorators/plug.decorator';
 import { timer } from '@gitroom/helpers/utils/timer';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
+
+// PhantomPulse: the version the existing analytics calls already use.
+const LINKEDIN_VERSION = '202601';
 
 @Rules(
   'LinkedIn can have maximum one attachment when selecting video, when choosing a carousel on LinkedIn minimum amount of attachment must be two, and only pictures, if uploading a video, LinkedIn can have only one attachment'
@@ -709,6 +717,316 @@ export class LinkedinPageProvider
     }
 
     return false;
+  }
+
+  // ── PhantomPulse: detailed analytics and comments ─────────────────────────
+
+  private linkedinHeaders(accessToken: string) {
+    return {
+      Authorization: `Bearer ${accessToken}`,
+      'LinkedIn-Version': LINKEDIN_VERSION,
+      'X-Restli-Protocol-Version': '2.0.0',
+    };
+  }
+
+  async accountInsights(
+    id: string,
+    accessToken: string,
+    days: number
+  ): Promise<AccountInsights> {
+    const { current, previous } = this.insightWindows(days);
+    const [series, previousSeries, demographics] = await Promise.all([
+      this.organizationSeries(id, accessToken, current.since, current.until),
+      this.organizationSeries(id, accessToken, previous.since, previous.until),
+      this.followerDemographics(id, accessToken),
+    ]);
+
+    // engagement is a daily rate, so it is kept as a series but not summed.
+    const summable = (list: typeof series) =>
+      list.filter((s) => s.metric !== 'engagement');
+    return {
+      series,
+      totals: this.sumSeries(summable(series)),
+      previousTotals: this.sumSeries(summable(previousSeries)),
+      demographics,
+    };
+  }
+
+  private async organizationSeries(
+    id: string,
+    accessToken: string,
+    since: number,
+    until: number
+  ) {
+    const organization = encodeURIComponent(`urn:li:organization:${id}`);
+    const interval = `timeIntervals=(timeRange:(start:${since * 1000},end:${
+      until * 1000
+    }),timeGranularityType:DAY)`;
+    const get = async (path: string) => {
+      const response = await (
+        await this.fetch(`https://api.linkedin.com/v2/${path}&${interval}`, {
+          headers: this.linkedinHeaders(accessToken),
+        })
+      ).json();
+      this.requireFields(
+        response,
+        ['elements'],
+        `LinkedIn ${path.split('?')[0]}`
+      );
+      return response.elements as any[];
+    };
+
+    const [pages, followers, shares] = await Promise.all([
+      get(
+        `organizationPageStatistics?q=organization&organization=${organization}`
+      ),
+      get(
+        `organizationalEntityFollowerStatistics?q=organizationalEntity&organizationalEntity=${organization}`
+      ),
+      get(
+        `organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${organization}`
+      ),
+    ]);
+
+    const series: Record<string, InsightPoint[]> = {};
+    const add = (metric: string, element: any, value: unknown) => {
+      if (value === undefined || value === null) return;
+      (series[metric] ??= []).push({
+        date: dayjs(element.timeRange?.start).format('YYYY-MM-DD'),
+        value: Number(value) || 0,
+      });
+    };
+
+    for (const e of pages) {
+      add(
+        'page_views',
+        e,
+        e.totalPageStatistics?.views?.allPageViews?.pageViews
+      );
+    }
+    for (const e of followers) {
+      const gains = e.followerGains;
+      if (gains) {
+        add(
+          'follows',
+          e,
+          (gains.organicFollowerGain || 0) + (gains.paidFollowerGain || 0)
+        );
+      }
+    }
+    for (const e of shares) {
+      const t = e.totalShareStatistics;
+      if (!t) continue;
+      add('impressions', e, t.impressionCount);
+      add('unique_impressions', e, t.uniqueImpressionsCount);
+      add('clicks', e, t.clickCount);
+      add('likes', e, t.likeCount);
+      add('comments', e, t.commentCount);
+      add('shares', e, t.shareCount);
+      add('engagement', e, t.engagement);
+    }
+
+    return Object.entries(series).map(([metric, points]) => ({
+      metric,
+      points,
+    }));
+  }
+
+  private async followerDemographics(id: string, accessToken: string) {
+    // Without timeIntervals the endpoint returns lifetime follower counts by
+    // facet. Keys are LinkedIn URNs/enums (urn:li:geo:..., SIZE_11_TO_50).
+    const response = await (
+      await this.fetch(
+        `https://api.linkedin.com/v2/organizationalEntityFollowerStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(
+          `urn:li:organization:${id}`
+        )}`,
+        { headers: this.linkedinHeaders(accessToken) }
+      )
+    ).json();
+    const element = response.elements?.[0] || {};
+
+    const facets: Record<string, [string, string]> = {
+      country: ['followerCountsByGeoCountry', 'geo'],
+      function: ['followerCountsByFunction', 'function'],
+      seniority: ['followerCountsBySeniority', 'seniority'],
+      industry: ['followerCountsByIndustry', 'industry'],
+      company_size: ['followerCountsByStaffCountRange', 'staffCountRange'],
+    };
+
+    return Object.fromEntries(
+      Object.entries(facets)
+        .map(([name, [field, keyField]]) => [
+          name,
+          ((element[field] || []) as any[])
+            .map((row) => ({
+              key: String(row[keyField] ?? ''),
+              value:
+                (row.followerCounts?.organicFollowerCount || 0) +
+                (row.followerCounts?.paidFollowerCount || 0),
+            }))
+            .sort((a, b) => b.value - a.value),
+        ])
+        .filter(([, values]) => (values as unknown[]).length)
+    );
+  }
+
+  async postInsights(
+    integrationId: string,
+    accessToken: string,
+    postId: string
+  ): Promise<PostInsights> {
+    // A ugcPost URN must be queried as ugcPosts=; shares= silently returns
+    // nothing for it.
+    const listParam = postId.includes(':ugcPost:') ? 'ugcPosts' : 'shares';
+    const [stats, metadata] = await Promise.all([
+      this.fetch(
+        `https://api.linkedin.com/v2/organizationalEntityShareStatistics?q=organizationalEntity&organizationalEntity=${encodeURIComponent(
+          `urn:li:organization:${integrationId}`
+        )}&${listParam}=List(${encodeURIComponent(postId)})`,
+        { headers: this.linkedinHeaders(accessToken) }
+      ).then((r) => r.json()),
+      this.fetch(
+        `https://api.linkedin.com/rest/socialMetadata/${encodeURIComponent(
+          postId
+        )}`,
+        { headers: this.linkedinHeaders(accessToken) }
+      ).then((r) => r.json()),
+    ]);
+    this.requireFields(stats, ['elements'], 'LinkedIn post statistics');
+
+    const t = stats.elements?.[0]?.totalShareStatistics || {};
+    const result: PostInsights = {
+      metrics: {
+        impressions: t.impressionCount ?? 0,
+        unique_impressions: t.uniqueImpressionsCount ?? 0,
+        clicks: t.clickCount ?? 0,
+        likes: t.likeCount ?? 0,
+        comments: t.commentCount ?? metadata.commentSummary?.count ?? 0,
+        shares: t.shareCount ?? 0,
+        engagement_rate: t.engagement ?? 0,
+      },
+      breakdowns: {},
+    };
+
+    const reactions = Object.values(metadata.reactionSummaries || {}) as any[];
+    if (reactions.length) {
+      result.breakdowns.reactions = Object.fromEntries(
+        reactions.map((r) => [
+          String(r.reactionType).toLowerCase(),
+          r.count || 0,
+        ])
+      );
+      result.metrics.reactions = reactions.reduce(
+        (sum, r) => sum + (r.count || 0),
+        0
+      );
+    }
+    return result;
+  }
+
+  async postComments(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    cursor?: string
+  ): Promise<CommentsPage> {
+    const start = Number(cursor) || 0;
+    const page = await this.linkedinComments(accessToken, postId, start);
+
+    // Replies live under their parent comment's URN, one call per thread.
+    const replies = await Promise.all(
+      page.elements
+        .filter(
+          (c: any) => (c.commentsSummary?.aggregatedTotalComments || 0) > 0
+        )
+        .map((c: any) => this.linkedinComments(accessToken, c.commentUrn, 0))
+    );
+
+    const comments = [
+      ...page.elements,
+      ...replies.flatMap((r) => r.elements),
+    ].map((c: any) => this.toLinkedinComment(c, integrationId));
+
+    const next = start + page.elements.length;
+    return {
+      comments,
+      nextCursor:
+        page.total !== null && next < page.total ? String(next) : null,
+      total: page.total,
+    };
+  }
+
+  private async linkedinComments(
+    accessToken: string,
+    threadUrn: string,
+    start: number
+  ) {
+    const response = await (
+      await this.fetch(
+        `https://api.linkedin.com/rest/socialActions/${encodeURIComponent(
+          threadUrn
+        )}/comments?start=${start}&count=50`,
+        { headers: this.linkedinHeaders(accessToken) }
+      )
+    ).json();
+    this.requireFields(response, ['elements'], 'LinkedIn comments');
+    return {
+      elements: response.elements as any[],
+      total: (response.paging?.total as number | undefined) ?? null,
+    };
+  }
+
+  private toLinkedinComment(c: any, integrationId: string): SocialComment {
+    const ownOrganization = c.actor === `urn:li:organization:${integrationId}`;
+    return {
+      // The comment URN, not the bare id: replies are posted under it.
+      id: c.commentUrn,
+      parentId: c.parentComment ?? null,
+      message: c.message?.text ?? '',
+      authorId: c.actor ?? null,
+      // Member names need a restricted permission, so only our own page's
+      // comments can be labelled.
+      authorName: ownOrganization ? this.name : null,
+      authorPicture: null,
+      createdAt: dayjs(c.created?.time).toISOString(),
+      likeCount: c.likesSummary?.totalLikes ?? 0,
+      replyCount: c.commentsSummary?.aggregatedTotalComments ?? 0,
+      hidden: false,
+      // LinkedIn allows one level of replies, and has no hide - only delete.
+      canReply: !c.parentComment,
+      canHide: false,
+    };
+  }
+
+  async replyComment(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string }> {
+    const response = await this.fetch(
+      `https://api.linkedin.com/rest/socialActions/${encodeURIComponent(
+        commentId
+      )}/comments`,
+      {
+        method: 'POST',
+        headers: {
+          ...this.linkedinHeaders(accessToken),
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          actor: `urn:li:organization:${integrationId}`,
+          object: postId,
+          parentComment: commentId,
+          message: { text: message },
+        }),
+      }
+    );
+    const body = await response.json().catch(() => ({}));
+    const id = body.commentUrn || response.headers.get('x-restli-id');
+    this.requireFields({ id }, ['id'], 'LinkedIn comment reply');
+    return { id };
   }
 }
 

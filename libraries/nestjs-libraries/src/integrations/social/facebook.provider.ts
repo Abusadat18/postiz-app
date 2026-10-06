@@ -1,7 +1,10 @@
 import {
+  AccountInsights,
   AnalyticsData,
   AuthTokenDetails,
+  CommentsPage,
   PendingCheckResponse,
+  PostInsights,
   PostDetails,
   PostResponse,
   SocialProvider,
@@ -24,6 +27,30 @@ import { timer } from '@gitroom/helpers/utils/timer';
 import { Rules } from '@gitroom/nestjs-libraries/chat/rules.description.decorator';
 
 export const META_GRAPH_API_VERSION = 'v25.0';
+
+// PhantomPulse: Graph page/post insight metric -> shared insight key.
+const FACEBOOK_PAGE_METRICS: Record<string, string> = {
+  page_total_media_view_unique: 'reach',
+  page_media_view: 'views',
+  page_post_engagements: 'engagement',
+  page_daily_follows: 'follows',
+};
+
+const FACEBOOK_VIDEO_METRICS: Record<string, string> = {
+  total_video_impressions: 'impressions',
+  total_video_views: 'video_views',
+  fb_reels_total_plays: 'plays',
+};
+
+// Graph insight values are a number, or an object keyed by type
+// (reactions by type, paid/organic) when the metric is broken down.
+const insightTotal = (value: any): number =>
+  value && typeof value === 'object'
+    ? Object.values(value as Record<string, number>).reduce(
+        (sum: number, v: number) => sum + (Number(v) || 0),
+        0
+      )
+    : Number(value) || 0;
 
 @Rules(
   "Facebook posts can be text only, or include photos or a video. If it's a story, it must have at least one attachment (photo or video), and each media is published as a separate story. Video posts (not stories) can carry an optional title."
@@ -1290,5 +1317,223 @@ export class FacebookProvider extends SocialAbstract implements SocialProvider {
       console.error('Error fetching Facebook video post analytics:', err);
       return [];
     }
+  }
+
+  // ── PhantomPulse: detailed analytics and comments ─────────────────────────
+
+  async accountInsights(
+    id: string,
+    accessToken: string,
+    days: number
+  ): Promise<AccountInsights> {
+    const { current, previous } = this.insightWindows(days);
+    const [series, previousSeries] = await Promise.all([
+      this.pageInsightSeries(id, accessToken, current.since, current.until),
+      this.pageInsightSeries(id, accessToken, previous.since, previous.until),
+    ]);
+
+    // Meta retired the page_fans_* demographic metrics, and Page insights
+    // offer no replacement, so Facebook has no demographics here.
+    return {
+      series,
+      totals: this.sumSeries(series),
+      previousTotals: this.sumSeries(previousSeries),
+      demographics: {},
+    };
+  }
+
+  private async pageInsightSeries(
+    id: string,
+    accessToken: string,
+    since: number,
+    until: number
+  ) {
+    const response = await (
+      await this.fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${id}/insights?metric=${Object.keys(
+          FACEBOOK_PAGE_METRICS
+        ).join(
+          ','
+        )}&period=day&since=${since}&until=${until}&access_token=${accessToken}`
+      )
+    ).json();
+    this.requireFields(response, ['data'], 'Facebook page insights');
+
+    return (response.data as any[]).map((metric) => ({
+      metric: FACEBOOK_PAGE_METRICS[metric.name] || metric.name,
+      points: (metric.values || []).map((v: any) => ({
+        date: dayjs(v.end_time).format('YYYY-MM-DD'),
+        value: insightTotal(v.value),
+      })),
+    }));
+  }
+
+  async postInsights(
+    integrationId: string,
+    accessToken: string,
+    postId: string
+  ): Promise<PostInsights> {
+    // Same id-shape rule as postAnalytics: feed posts are `{pageid}_{postid}`,
+    // reels/videos/stories are a bare id with only the video_insights edge.
+    if (!postId.includes('_')) {
+      return this.videoPostInsights(accessToken, postId);
+    }
+
+    const [insights, node] = await Promise.all([
+      this.fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}/insights?metric=post_total_media_view_unique,post_reactions_by_type_total,post_clicks,post_clicks_by_type&access_token=${accessToken}`
+      ).then((r) => r.json()),
+      this.fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}?fields=shares,comments.limit(0).summary(true),reactions.limit(0).summary(true)&access_token=${accessToken}`
+      ).then((r) => r.json()),
+    ]);
+    this.requireFields(insights, ['data'], 'Facebook post insights');
+
+    const result: PostInsights = { metrics: {}, breakdowns: {} };
+    for (const metric of insights.data as any[]) {
+      const value = metric.values?.[0]?.value;
+      if (value === undefined) continue;
+
+      switch (metric.name) {
+        case 'post_total_media_view_unique':
+          result.metrics.reach = insightTotal(value);
+          break;
+        case 'post_clicks':
+          result.metrics.clicks = insightTotal(value);
+          break;
+        case 'post_clicks_by_type':
+          result.breakdowns.clicks = value;
+          break;
+        case 'post_reactions_by_type_total':
+          result.breakdowns.reactions = value;
+          result.metrics.reactions = insightTotal(value);
+          break;
+      }
+    }
+
+    result.metrics.comments = node.comments?.summary?.total_count ?? 0;
+    result.metrics.shares = node.shares?.count ?? 0;
+    result.metrics.reactions ??= node.reactions?.summary?.total_count ?? 0;
+    return result;
+  }
+
+  private async videoPostInsights(
+    accessToken: string,
+    videoId: string
+  ): Promise<PostInsights> {
+    // Plain fetch, not this.fetch: stories answer "(#100) nonexisting field
+    // (video_insights)", which is expected and must not count as an API change.
+    const { data, error } = await (
+      await fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${videoId}/video_insights?metric=total_video_impressions,total_video_views,total_video_reactions_by_type_total,fb_reels_total_plays,post_video_likes_by_reaction_type,post_video_social_actions&access_token=${accessToken}`
+      )
+    ).json();
+
+    const result: PostInsights = { metrics: {}, breakdowns: {} };
+    if (error) {
+      if (/nonexisting field/i.test(error.message || '')) {
+        return result;
+      }
+      throw new BadBody(
+        this.identifier,
+        JSON.stringify(error),
+        '{}',
+        error.message || 'Facebook video insights failed'
+      );
+    }
+
+    for (const metric of (data || []) as any[]) {
+      const value = metric.values?.[0]?.value;
+      if (value === undefined) continue;
+
+      if (FACEBOOK_VIDEO_METRICS[metric.name]) {
+        result.metrics[FACEBOOK_VIDEO_METRICS[metric.name]] =
+          insightTotal(value);
+      } else if (
+        metric.name === 'total_video_reactions_by_type_total' ||
+        metric.name === 'post_video_likes_by_reaction_type'
+      ) {
+        result.breakdowns.reactions = value;
+        result.metrics.reactions = insightTotal(value);
+      } else if (metric.name === 'post_video_social_actions') {
+        result.breakdowns.social_actions = value;
+        result.metrics.comments = Number(value?.COMMENT) || 0;
+        result.metrics.shares = Number(value?.SHARE) || 0;
+      }
+    }
+    return result;
+  }
+
+  async postComments(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    cursor?: string
+  ): Promise<CommentsPage> {
+    // filter=stream returns replies too, each with its parent, so one call
+    // gives the whole thread. `from` is omitted for commenters the app may
+    // not identify, so the author fields stay nullable.
+    const response = await (
+      await this.fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${postId}/comments?fields=id,message,created_time,from{id,name,picture},like_count,comment_count,is_hidden,can_hide,can_comment,parent{id}&filter=stream&order=reverse_chronological&summary=true&limit=50${
+          cursor ? `&after=${encodeURIComponent(cursor)}` : ''
+        }&access_token=${accessToken}`
+      )
+    ).json();
+    this.requireFields(response, ['data'], 'Facebook comments');
+
+    return {
+      comments: (response.data as any[]).map((c) => ({
+        id: c.id,
+        parentId: c.parent?.id ?? null,
+        message: c.message ?? '',
+        authorId: c.from?.id ?? null,
+        authorName: c.from?.name ?? null,
+        authorPicture: c.from?.picture?.data?.url ?? null,
+        createdAt: dayjs(c.created_time).toISOString(),
+        likeCount: c.like_count ?? 0,
+        replyCount: c.comment_count ?? 0,
+        hidden: !!c.is_hidden,
+        canReply: c.can_comment !== false,
+        canHide: !!c.can_hide,
+      })),
+      nextCursor: response.paging?.next
+        ? response.paging?.cursors?.after ?? null
+        : null,
+      total: response.summary?.total_count ?? null,
+    };
+  }
+
+  async replyComment(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string }> {
+    const response = await (
+      await this.fetch(
+        `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${commentId}/comments?access_token=${accessToken}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify({ message }),
+        }
+      )
+    ).json();
+    this.requireFields(response, ['id'], 'Facebook comment reply');
+    return { id: response.id };
+  }
+
+  async hideComment(
+    integrationId: string,
+    accessToken: string,
+    commentId: string,
+    hidden: boolean
+  ): Promise<void> {
+    await this.fetch(
+      `https://graph.facebook.com/${META_GRAPH_API_VERSION}/${commentId}?is_hidden=${hidden}&access_token=${accessToken}`,
+      { method: 'POST' }
+    );
   }
 }
