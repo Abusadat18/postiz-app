@@ -1,7 +1,12 @@
 import {
+  AccountInsights,
   AnalyticsData,
   AuthTokenDetails,
+  CommentsPage,
+  InsightPoint,
   PendingCheckResponse,
+  PostInsights,
+  SocialComment,
   PostDetails,
   PostResponse,
   SocialProvider,
@@ -52,6 +57,22 @@ const clientAndYoutube = () => {
 
   return { client, youtube, oauth2, youtubeAnalytics };
 };
+
+// PhantomPulse: YouTube Analytics metric -> shared insight key.
+const YOUTUBE_METRICS: Record<string, string> = {
+  views: 'views',
+  estimatedMinutesWatched: 'watch_minutes',
+  averageViewDuration: 'average_view_duration',
+  likes: 'likes',
+  dislikes: 'dislikes',
+  comments: 'comments',
+  shares: 'shares',
+  subscribersGained: 'follows',
+  subscribersLost: 'unfollows',
+};
+
+// Averages, so they are kept as a series but not summed into totals.
+const YOUTUBE_AVERAGE_METRICS = ['average_view_duration'];
 
 @Rules('YouTube must have on video attachment, it cannot be empty')
 export class YoutubeProvider extends SocialAbstract implements SocialProvider {
@@ -238,6 +259,13 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
         type: 'bad-body',
         value:
           'Your account is not verified, we have uploaded your video but we could not set the thumbnail. Please verify your account and try again.',
+      };
+    }
+
+    if (body.includes('commentsDisabled')) {
+      return {
+        type: 'bad-body',
+        value: 'Comments are turned off for this video.',
       };
     }
 
@@ -1033,5 +1061,366 @@ export class YoutubeProvider extends SocialAbstract implements SocialProvider {
       console.error('Error fetching YouTube post analytics:', err);
       return [];
     }
+  }
+
+  // ── PhantomPulse: detailed analytics and comments ─────────────────────────
+  // REST through this.fetch rather than the googleapis client, so an expired
+  // token becomes RefreshToken and a changed response becomes ContractChanged.
+
+  private youtubeHeaders(accessToken: string) {
+    return { Authorization: `Bearer ${accessToken}` };
+  }
+
+  /** A YouTube Analytics report as one object per row, keyed by column name. */
+  private async youtubeReport(
+    accessToken: string,
+    params: Record<string, string>
+  ): Promise<Record<string, any>[]> {
+    const response = await (
+      await this.fetch(
+        `https://youtubeanalytics.googleapis.com/v2/reports?${new URLSearchParams(
+          { ids: 'channel==MINE', ...params }
+        )}`,
+        { headers: this.youtubeHeaders(accessToken) }
+      )
+    ).json();
+    // `rows` is left out when there is no data for the range.
+    this.requireFields(response, ['columnHeaders'], 'YouTube Analytics report');
+
+    const columns = (response.columnHeaders as any[]).map((c) => c.name);
+    return ((response.rows || []) as any[][]).map((row) =>
+      Object.fromEntries(columns.map((name, index) => [name, row[index]]))
+    );
+  }
+
+  async accountInsights(
+    id: string,
+    accessToken: string,
+    days: number
+  ): Promise<AccountInsights> {
+    const { current, previous } = this.insightWindows(days);
+    const [series, previousSeries, demographics] = await Promise.all([
+      this.channelSeries(accessToken, current),
+      this.channelSeries(accessToken, previous),
+      this.channelDemographics(accessToken, current),
+    ]);
+
+    const summable = (list: typeof series) =>
+      list.filter((s) => !YOUTUBE_AVERAGE_METRICS.includes(s.metric));
+    return {
+      series,
+      totals: this.sumSeries(summable(series)),
+      previousTotals: this.sumSeries(summable(previousSeries)),
+      demographics,
+    };
+  }
+
+  private async channelSeries(
+    accessToken: string,
+    window: { since: number; until: number }
+  ) {
+    const { start, end } = this.insightDates(window);
+    const rows = await this.youtubeReport(accessToken, {
+      startDate: start.format('YYYY-MM-DD'),
+      endDate: end.format('YYYY-MM-DD'),
+      metrics: Object.keys(YOUTUBE_METRICS).join(','),
+      dimensions: 'day',
+      sort: 'day',
+    });
+
+    return Object.entries(YOUTUBE_METRICS).map(([name, metric]) => ({
+      metric,
+      points: rows.map(
+        (row): InsightPoint => ({
+          date: row.day,
+          value: Number(row[name]) || 0,
+        })
+      ),
+    }));
+  }
+
+  private async channelDemographics(
+    accessToken: string,
+    window: { since: number; until: number }
+  ) {
+    const { start, end } = this.insightDates(window);
+    const report = (dimensions: string, metrics: string) =>
+      this.youtubeReport(accessToken, {
+        startDate: start.format('YYYY-MM-DD'),
+        endDate: end.format('YYYY-MM-DD'),
+        dimensions,
+        metrics,
+      });
+
+    const [ageGender, country, device, traffic] = await Promise.all([
+      report('ageGroup,gender', 'viewerPercentage'),
+      report('country', 'views'),
+      report('deviceType', 'views'),
+      report('insightTrafficSourceType', 'views'),
+    ]);
+
+    // age_gender is the percentage of viewers (e.g. age25-34_female: 12.5),
+    // the others are view counts.
+    const facets: Record<string, { key: string; value: number }[]> = {
+      age_gender: ageGender.map((row) => ({
+        key: `${row.ageGroup}_${row.gender}`,
+        value: Number(row.viewerPercentage) || 0,
+      })),
+      country: country.map((row) => ({
+        key: row.country,
+        value: Number(row.views) || 0,
+      })),
+      device: device.map((row) => ({
+        key: String(row.deviceType).toLowerCase(),
+        value: Number(row.views) || 0,
+      })),
+      traffic_source: traffic.map((row) => ({
+        key: String(row.insightTrafficSourceType).toLowerCase(),
+        value: Number(row.views) || 0,
+      })),
+    };
+    return Object.fromEntries(
+      Object.entries(facets)
+        .filter(([, values]) => values.length)
+        .map(([name, values]) => [
+          name,
+          values.sort((a, b) => b.value - a.value),
+        ])
+    );
+  }
+
+  async postInsights(
+    integrationId: string,
+    accessToken: string,
+    postId: string
+  ): Promise<PostInsights> {
+    const videos = await (
+      await this.fetch(
+        `https://www.googleapis.com/youtube/v3/videos?part=statistics,snippet&id=${encodeURIComponent(
+          postId
+        )}`,
+        { headers: this.youtubeHeaders(accessToken) }
+      )
+    ).json();
+    this.requireFields(videos, ['items'], 'YouTube video');
+
+    const result: PostInsights = { metrics: {}, breakdowns: {} };
+    const video = videos.items[0];
+    if (!video) {
+      // Deleted or made private after it was published.
+      return result;
+    }
+
+    const stats = video.statistics || {};
+    result.metrics.views = Number(stats.viewCount) || 0;
+    result.metrics.likes = Number(stats.likeCount) || 0;
+    result.metrics.comments = Number(stats.commentCount) || 0;
+    result.metrics.favorites = Number(stats.favoriteCount) || 0;
+
+    // Analytics lag a day or two behind the counters above, so they only add
+    // what the counters do not have.
+    const range = {
+      startDate: dayjs(video.snippet?.publishedAt).format('YYYY-MM-DD'),
+      endDate: dayjs().format('YYYY-MM-DD'),
+      filters: `video==${postId}`,
+    };
+    const [[lifetime], traffic] = await Promise.all([
+      this.youtubeReport(accessToken, {
+        ...range,
+        metrics:
+          'estimatedMinutesWatched,averageViewDuration,averageViewPercentage,shares,dislikes,subscribersGained',
+      }),
+      this.youtubeReport(accessToken, {
+        ...range,
+        dimensions: 'insightTrafficSourceType',
+        metrics: 'views',
+      }),
+    ]);
+
+    if (lifetime) {
+      result.metrics.watch_minutes =
+        Number(lifetime.estimatedMinutesWatched) || 0;
+      result.metrics.average_view_duration =
+        Number(lifetime.averageViewDuration) || 0;
+      result.metrics.average_view_percentage =
+        Number(lifetime.averageViewPercentage) || 0;
+      result.metrics.shares = Number(lifetime.shares) || 0;
+      result.metrics.dislikes = Number(lifetime.dislikes) || 0;
+      result.metrics.follows = Number(lifetime.subscribersGained) || 0;
+    }
+    if (traffic.length) {
+      result.breakdowns.traffic_source = Object.fromEntries(
+        traffic.map((row) => [
+          String(row.insightTrafficSourceType).toLowerCase(),
+          Number(row.views) || 0,
+        ])
+      );
+    }
+    return result;
+  }
+
+  async postComments(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    cursor?: string
+  ): Promise<CommentsPage> {
+    const response = await (
+      await this.fetch(
+        `https://www.googleapis.com/youtube/v3/commentThreads?${new URLSearchParams(
+          {
+            part: 'snippet,replies',
+            videoId: postId,
+            maxResults: '100',
+            order: 'time',
+            textFormat: 'plainText',
+            ...(cursor ? { pageToken: cursor } : {}),
+          }
+        )}`,
+        { headers: this.youtubeHeaders(accessToken) }
+      )
+    ).json();
+    this.requireFields(response, ['items'], 'YouTube comment threads');
+
+    // A thread carries at most 5 replies; longer threads need their own call.
+    const threads = await Promise.all(
+      (response.items as any[]).map(async (thread) => {
+        const included = thread.replies?.comments || [];
+        const replies =
+          (thread.snippet?.totalReplyCount || 0) > included.length
+            ? await this.youtubeReplies(
+                accessToken,
+                thread.snippet.topLevelComment.id
+              )
+            : included;
+        const canReply = thread.snippet?.canReply !== false;
+        return [
+          this.toYoutubeComment(
+            thread.snippet.topLevelComment,
+            canReply,
+            thread.snippet?.totalReplyCount || 0
+          ),
+          ...replies.map((reply: any) =>
+            this.toYoutubeComment(reply, canReply, 0)
+          ),
+        ];
+      })
+    );
+
+    return {
+      comments: threads.flat(),
+      nextCursor: response.nextPageToken ?? null,
+      // pageInfo.totalResults counts this page only, not the video.
+      total: null,
+    };
+  }
+
+  private async youtubeReplies(accessToken: string, parentId: string) {
+    const response = await (
+      await this.fetch(
+        `https://www.googleapis.com/youtube/v3/comments?${new URLSearchParams({
+          part: 'snippet',
+          parentId,
+          maxResults: '100',
+          textFormat: 'plainText',
+        })}`,
+        { headers: this.youtubeHeaders(accessToken) }
+      )
+    ).json();
+    this.requireFields(response, ['items'], 'YouTube comment replies');
+    return response.items as any[];
+  }
+
+  private toYoutubeComment(
+    c: any,
+    canReply: boolean,
+    replyCount: number
+  ): SocialComment {
+    return {
+      id: c.id,
+      parentId: c.snippet?.parentId ?? null,
+      message: c.snippet?.textDisplay ?? c.snippet?.textOriginal ?? '',
+      authorId: c.snippet?.authorChannelId?.value ?? null,
+      authorName: c.snippet?.authorDisplayName ?? null,
+      authorPicture: c.snippet?.authorProfileImageUrl ?? null,
+      createdAt: dayjs(c.snippet?.publishedAt).toISOString(),
+      likeCount: c.snippet?.likeCount ?? 0,
+      replyCount,
+      // Held comments are not listed, so every listed comment is visible.
+      hidden: false,
+      canReply,
+      canHide: true,
+    };
+  }
+
+  async replyComment(
+    integrationId: string,
+    accessToken: string,
+    postId: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string }> {
+    // YouTube threads are one level deep: a reply id is `{parentId}.{replyId}`,
+    // and an answer to a reply goes to its thread.
+    const response = await (
+      await this.fetch(
+        'https://www.googleapis.com/youtube/v3/comments?part=snippet',
+        {
+          method: 'POST',
+          headers: {
+            ...this.youtubeHeaders(accessToken),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({
+            snippet: {
+              parentId: commentId.split('.')[0],
+              textOriginal: message,
+            },
+          }),
+        }
+      )
+    ).json();
+    this.requireFields(response, ['id'], 'YouTube comment reply');
+    return { id: response.id };
+  }
+
+  async hideComment(
+    integrationId: string,
+    accessToken: string,
+    commentId: string,
+    hidden: boolean
+  ): Promise<void> {
+    // YouTube has no hide: "heldForReview" takes the comment off the video
+    // until it is approved again with "published". The call answers 204,
+    // which this.fetch treats as an error, so it uses plain fetch.
+    const response = await fetch(
+      `https://www.googleapis.com/youtube/v3/comments/setModerationStatus?${new URLSearchParams(
+        {
+          id: commentId,
+          moderationStatus: hidden ? 'heldForReview' : 'published',
+        }
+      )}`,
+      {
+        method: 'POST',
+        headers: this.youtubeHeaders(accessToken),
+        // @ts-ignore - undici-only option, not in the lib.dom RequestInit type
+        dispatcher: getSsrfSafeDispatcher(),
+      }
+    );
+    if (response.ok) {
+      return;
+    }
+
+    const body = await response.text().catch(() => '{}');
+    const handled = this.handleErrors(body);
+    if (response.status === 401 || handled?.type === 'refresh-token') {
+      throw new RefreshToken(this.identifier, body, '{}', handled?.value);
+    }
+    throw new BadBody(
+      this.identifier,
+      body,
+      '{}',
+      handled?.value || 'YouTube could not change the comment status'
+    );
   }
 }

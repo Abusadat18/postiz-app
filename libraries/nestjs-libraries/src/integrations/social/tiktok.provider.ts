@@ -1,7 +1,10 @@
 import {
+  AccountInsights,
   AnalyticsData,
   AuthTokenDetails,
+  InsightPoint,
   PendingCheckResponse,
+  PostInsights,
   PostDetails,
   PostResponse,
   SocialProvider,
@@ -1253,5 +1256,159 @@ export class TiktokProvider extends SocialAbstract implements SocialProvider {
       console.error('Error fetching TikTok post analytics:', err);
       return [];
     }
+  }
+
+  // ── PhantomPulse: detailed analytics ──────────────────────────────────────
+  // The Display API has no daily account metrics and no comment endpoints
+  // (comment text is only in the Research API, for approved researchers), so
+  // TikTok has insights only, built from the videos and the profile counters.
+
+  async accountInsights(
+    id: string,
+    accessToken: string,
+    days: number
+  ): Promise<AccountInsights> {
+    const { current, previous } = this.insightWindows(days);
+    const [user, videos] = await Promise.all([
+      this.tiktokUserStats(accessToken),
+      this.tiktokVideosSince(accessToken, previous.since),
+    ]);
+
+    const inWindow = (window: { since: number; until: number }) =>
+      videos.filter(
+        (v) => v.create_time > window.since && v.create_time <= window.until
+      );
+    const series = this.videoSeries(inWindow(current));
+
+    return {
+      series,
+      // followers/following/total_likes are the profile's counters right now;
+      // TikTok keeps no history, so previousTotals has no value for them.
+      totals: {
+        ...this.sumSeries(series),
+        followers: Number(user.follower_count) || 0,
+        following: Number(user.following_count) || 0,
+        total_likes: Number(user.likes_count) || 0,
+        total_posts: Number(user.video_count) || 0,
+      },
+      previousTotals: this.sumSeries(this.videoSeries(inWindow(previous))),
+      demographics: {},
+    };
+  }
+
+  private async tiktokUserStats(accessToken: string) {
+    const response = await (
+      await this.fetch(
+        'https://open.tiktokapis.com/v2/user/info/?fields=follower_count,following_count,likes_count,video_count',
+        { headers: { Authorization: `Bearer ${accessToken}` } }
+      )
+    ).json();
+    this.requireFields(response, ['data.user'], 'TikTok user info');
+    return response.data.user;
+  }
+
+  /** Videos newest first, until one is older than `since` (unix seconds). */
+  private async tiktokVideosSince(accessToken: string, since: number) {
+    const videos: any[] = [];
+    let cursor: number | undefined;
+    // 20 videos a page; 15 pages bounds the calls for very active accounts.
+    for (let page = 0; page < 15; page++) {
+      const response = await (
+        await this.fetch(
+          'https://open.tiktokapis.com/v2/video/list/?fields=id,create_time,view_count,like_count,comment_count,share_count',
+          {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              Authorization: `Bearer ${accessToken}`,
+            },
+            body: JSON.stringify({
+              max_count: 20,
+              ...(cursor ? { cursor } : {}),
+            }),
+          }
+        )
+      ).json();
+      this.requireFields(response, ['data'], 'TikTok video list');
+
+      const list = (response.data.videos || []) as any[];
+      videos.push(...list);
+      if (
+        !response.data.has_more ||
+        !list.length ||
+        list[list.length - 1].create_time <= since
+      ) {
+        break;
+      }
+      cursor = response.data.cursor;
+    }
+    return videos;
+  }
+
+  /**
+   * One point per publish day. Values are the lifetime counts of the videos
+   * published that day, not the day's activity: TikTok has no daily metrics.
+   */
+  private videoSeries(videos: any[]) {
+    const metrics: Record<string, string> = {
+      view_count: 'views',
+      like_count: 'likes',
+      comment_count: 'comments',
+      share_count: 'shares',
+    };
+    const byDay: Record<string, Record<string, number>> = {};
+    for (const video of videos) {
+      const date = dayjs.unix(video.create_time).format('YYYY-MM-DD');
+      const day = (byDay[date] ??= { posts: 0 });
+      day.posts += 1;
+      for (const [field, metric] of Object.entries(metrics)) {
+        day[metric] = (day[metric] || 0) + (Number(video[field]) || 0);
+      }
+    }
+
+    const days = Object.keys(byDay).sort();
+    return ['posts', ...Object.values(metrics)].map((metric) => ({
+      metric,
+      points: days.map(
+        (date): InsightPoint => ({ date, value: byDay[date][metric] || 0 })
+      ),
+    }));
+  }
+
+  async postInsights(
+    integrationId: string,
+    accessToken: string,
+    postId: string
+  ): Promise<PostInsights> {
+    const response = await (
+      await this.fetch(
+        'https://open.tiktokapis.com/v2/video/query/?fields=id,view_count,like_count,comment_count,share_count,duration',
+        {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            Authorization: `Bearer ${accessToken}`,
+          },
+          body: JSON.stringify({ filters: { video_ids: [postId] } }),
+        }
+      )
+    ).json();
+    this.requireFields(response, ['data'], 'TikTok video query');
+
+    const result: PostInsights = { metrics: {}, breakdowns: {} };
+    const video = response.data.videos?.[0];
+    if (!video) {
+      // Deleted or made private after it was published.
+      return result;
+    }
+
+    result.metrics.views = Number(video.view_count) || 0;
+    result.metrics.likes = Number(video.like_count) || 0;
+    result.metrics.comments = Number(video.comment_count) || 0;
+    result.metrics.shares = Number(video.share_count) || 0;
+    if (video.duration !== undefined) {
+      result.metrics.duration = Number(video.duration) || 0;
+    }
+    return result;
   }
 }

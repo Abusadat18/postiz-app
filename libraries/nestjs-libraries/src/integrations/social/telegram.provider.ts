@@ -1,4 +1,5 @@
 import {
+  AccountInsights,
   AuthTokenDetails,
   PostDetails,
   PostResponse,
@@ -342,6 +343,38 @@ export class TelegramProvider extends SocialAbstract implements SocialProvider {
 
     return [];
   }
+
+  // PhantomPulse: the Bot API has no message history, view counts or channel
+  // comments, and reading updates would take them from the getUpdates loop
+  // that connects channels. The member count is all a bot can read on demand.
+  async accountInsights(
+    id: string,
+    accessToken: string,
+    days: number
+  ): Promise<AccountInsights> {
+    try {
+      const members = await telegramBot.getChatMemberCount(accessToken);
+      return {
+        series: [],
+        // The current count; Telegram keeps no history for previousTotals.
+        totals: { followers: members },
+        previousTotals: {},
+        demographics: {},
+      };
+    } catch (error: any) {
+      const body = error?.response?.body;
+      if (error?.code === 'ETELEGRAM' && body?.description) {
+        throw new BadBody(
+          'telegram-error',
+          JSON.stringify(body),
+          Buffer.from('{}'),
+          `Telegram refused the member count: ${body.description}`
+        );
+      }
+      throw error;
+    }
+  }
+
   // chunkMedia is used to split media into groups of "size". 10 is used here because telegram api allows a maximum of 10 media per group
   private chunkMedia(media: { type: string; media: string }[], size: number) {
     const result = [];

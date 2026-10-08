@@ -211,6 +211,19 @@ export abstract class SocialAbstract {
     };
   }
 
+  /**
+   * PhantomPulse: an insightWindows window as the first and last calendar day
+   * it covers, for APIs that take inclusive dates instead of timestamps.
+   * `since` is the end of the day before the window, so the window starts a
+   * second later.
+   */
+  protected insightDates(window: { since: number; until: number }) {
+    return {
+      start: dayjs.unix(window.since + 1),
+      end: dayjs.unix(window.until),
+    };
+  }
+
   /** PhantomPulse: sums each series into one total per metric. */
   protected sumSeries(
     series: { metric: string; points: { value: number }[] }[]

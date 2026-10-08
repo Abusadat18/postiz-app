@@ -1,6 +1,10 @@
 import {
+  AccountInsights,
   AnalyticsData,
   AuthTokenDetails,
+  CommentsPage,
+  InsightPoint,
+  SocialComment,
   PostDetails,
   PostResponse,
   SocialProvider,
@@ -33,6 +37,29 @@ const clientAndGmb = () => {
     });
 
   return { client, oauth2 };
+};
+
+// PhantomPulse: Business Profile Performance daily metric -> shared insight key.
+const GMB_DAILY_METRICS: Record<string, string> = {
+  BUSINESS_IMPRESSIONS_DESKTOP_MAPS: 'impressions_desktop_maps',
+  BUSINESS_IMPRESSIONS_DESKTOP_SEARCH: 'impressions_desktop_search',
+  BUSINESS_IMPRESSIONS_MOBILE_MAPS: 'impressions_mobile_maps',
+  BUSINESS_IMPRESSIONS_MOBILE_SEARCH: 'impressions_mobile_search',
+  BUSINESS_CONVERSATIONS: 'conversations',
+  BUSINESS_DIRECTION_REQUESTS: 'direction_requests',
+  CALL_CLICKS: 'call_clicks',
+  WEBSITE_CLICKS: 'website_clicks',
+  BUSINESS_BOOKINGS: 'bookings',
+  BUSINESS_FOOD_ORDERS: 'food_orders',
+  BUSINESS_FOOD_MENU_CLICKS: 'food_menu_clicks',
+};
+
+const GMB_STAR_RATING: Record<string, number> = {
+  ONE: 1,
+  TWO: 2,
+  THREE: 3,
+  FOUR: 4,
+  FIVE: 5,
 };
 
 @Rules(
@@ -644,5 +671,230 @@ export class GmbProvider extends SocialAbstract implements SocialProvider {
     // Google My Business local posts don't have detailed individual post analytics
     // The API focuses on location-level metrics rather than post-level metrics
     return [];
+  }
+
+  // ── PhantomPulse: detailed analytics and reviews ──────────────────────────
+  // Google retired local post insights and local posts take no comments, so
+  // GMB has no postInsights/postComments: insights are per location, and the
+  // audience's comments are the location's reviews (accountComments).
+
+  private gmbHeaders(accessToken: string) {
+    return { Authorization: `Bearer ${accessToken}` };
+  }
+
+  async accountInsights(
+    id: string,
+    accessToken: string,
+    days: number
+  ): Promise<AccountInsights> {
+    const { current, previous } = this.insightWindows(days);
+    const [series, previousSeries, keywords] = await Promise.all([
+      this.locationSeries(id, accessToken, current),
+      this.locationSeries(id, accessToken, previous),
+      this.searchKeywords(id, accessToken, current),
+    ]);
+
+    return {
+      series,
+      totals: this.sumSeries(series),
+      previousTotals: this.sumSeries(previousSeries),
+      demographics: keywords.length ? { search_keywords: keywords } : {},
+    };
+  }
+
+  private async locationSeries(
+    id: string,
+    accessToken: string,
+    window: { since: number; until: number }
+  ) {
+    const { start, end } = this.insightDates(window);
+    // id is accounts/{accountId}/locations/{locationId}; the Performance API
+    // takes locations/{locationId}.
+    const params = new URLSearchParams({
+      'dailyRange.startDate.year': String(start.year()),
+      'dailyRange.startDate.month': String(start.month() + 1),
+      'dailyRange.startDate.day': String(start.date()),
+      'dailyRange.endDate.year': String(end.year()),
+      'dailyRange.endDate.month': String(end.month() + 1),
+      'dailyRange.endDate.day': String(end.date()),
+    });
+    for (const metric of Object.keys(GMB_DAILY_METRICS)) {
+      params.append('dailyMetrics', metric);
+    }
+
+    const response = await (
+      await this.fetch(
+        `https://businessprofileperformance.googleapis.com/v1/locations/${
+          id.split('/locations/')[1]
+        }:fetchMultiDailyMetricsTimeSeries?${params}`,
+        { headers: this.gmbHeaders(accessToken) }
+      )
+    ).json();
+
+    // Not checked with requireFields: Google leaves empty lists out of the
+    // JSON, so a location without data answers {}.
+    const series: Record<string, InsightPoint[]> = {};
+    const impressions: Record<string, number> = {};
+    for (const group of (response.multiDailyMetricTimeSeries || []) as any[]) {
+      for (const metric of (group.dailyMetricTimeSeries || []) as any[]) {
+        const key = GMB_DAILY_METRICS[metric.dailyMetric] || metric.dailyMetric;
+        for (const dated of (metric.timeSeries?.datedValues || []) as any[]) {
+          const date = `${dated.date.year}-${String(dated.date.month).padStart(
+            2,
+            '0'
+          )}-${String(dated.date.day).padStart(2, '0')}`;
+          // `value` is an int64 string, left out on days with zero.
+          const value = Number(dated.value) || 0;
+          (series[key] ??= []).push({ date, value });
+          if (key.startsWith('impressions_')) {
+            impressions[date] = (impressions[date] || 0) + value;
+          }
+        }
+      }
+    }
+
+    // Google splits views by device and surface; `impressions` is their sum,
+    // comparable with the other platforms.
+    series.impressions = Object.entries(impressions)
+      .sort(([a], [b]) => a.localeCompare(b))
+      .map(([date, value]) => ({ date, value }));
+
+    return Object.entries(series).map(([metric, points]) => ({
+      metric,
+      points,
+    }));
+  }
+
+  private async searchKeywords(
+    id: string,
+    accessToken: string,
+    window: { since: number; until: number }
+  ) {
+    const { start, end } = this.insightDates(window);
+    // Plain fetch: keywords are monthly and often missing for the current
+    // month or small locations, which must not fail the whole insights call.
+    try {
+      const response = await (
+        await fetch(
+          `https://businessprofileperformance.googleapis.com/v1/locations/${
+            id.split('/locations/')[1]
+          }/searchkeywords/impressions/monthly?${new URLSearchParams({
+            'monthlyRange.startMonth.year': String(start.year()),
+            'monthlyRange.startMonth.month': String(start.month() + 1),
+            'monthlyRange.endMonth.year': String(end.year()),
+            'monthlyRange.endMonth.month': String(end.month() + 1),
+            pageSize: '100',
+          })}`,
+          { headers: this.gmbHeaders(accessToken) }
+        )
+      ).json();
+
+      // Low counts come as a `threshold` ("under 15") instead of a value.
+      return ((response.searchKeywordsCounts || []) as any[])
+        .map((row) => ({
+          key: String(row.searchKeyword ?? ''),
+          value:
+            Number(row.insightsValue?.value ?? row.insightsValue?.threshold) ||
+            0,
+        }))
+        .sort((a, b) => b.value - a.value);
+    } catch (err) {
+      return [];
+    }
+  }
+
+  async accountComments(
+    id: string,
+    accessToken: string,
+    cursor?: string
+  ): Promise<CommentsPage> {
+    const response = await (
+      await this.fetch(
+        `https://mybusiness.googleapis.com/v4/${id}/reviews?${new URLSearchParams(
+          {
+            pageSize: '50',
+            orderBy: 'updateTime desc',
+            ...(cursor ? { pageToken: cursor } : {}),
+          }
+        )}`,
+        { headers: this.gmbHeaders(accessToken) },
+        'list reviews'
+      )
+    ).json();
+
+    // `reviews` and `totalReviewCount` are left out when there are none.
+    const comments = ((response.reviews || []) as any[]).flatMap((review) => {
+      const item: SocialComment = {
+        id: review.reviewId,
+        parentId: null,
+        message: review.comment ?? '',
+        authorId: null,
+        authorName: review.reviewer?.isAnonymous
+          ? null
+          : review.reviewer?.displayName ?? null,
+        authorPicture: review.reviewer?.profilePhotoUrl ?? null,
+        createdAt: dayjs(review.createTime).toISOString(),
+        likeCount: 0,
+        replyCount: review.reviewReply ? 1 : 0,
+        hidden: false,
+        // A new reply replaces the owner's existing one.
+        canReply: true,
+        canHide: false,
+        rating: GMB_STAR_RATING[review.starRating],
+      };
+      if (!review.reviewReply) {
+        return [item];
+      }
+
+      const reply: SocialComment = {
+        id: `${review.reviewId}:reply`,
+        parentId: review.reviewId,
+        message: review.reviewReply.comment ?? '',
+        // The owner's reply: authorId is the location, like a page's own
+        // comment on the other platforms.
+        authorId: id,
+        authorName: null,
+        authorPicture: null,
+        createdAt: dayjs(review.reviewReply.updateTime).toISOString(),
+        likeCount: 0,
+        replyCount: 0,
+        hidden: false,
+        canReply: false,
+        canHide: false,
+      };
+      return [item, reply];
+    });
+
+    return {
+      comments,
+      nextCursor: response.nextPageToken ?? null,
+      total: response.totalReviewCount ?? 0,
+    };
+  }
+
+  async replyAccountComment(
+    id: string,
+    accessToken: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string }> {
+    const response = await (
+      await this.fetch(
+        `https://mybusiness.googleapis.com/v4/${id}/reviews/${encodeURIComponent(
+          commentId
+        )}/reply`,
+        {
+          method: 'PUT',
+          headers: {
+            ...this.gmbHeaders(accessToken),
+            'Content-Type': 'application/json',
+          },
+          body: JSON.stringify({ comment: message }),
+        },
+        'reply to review'
+      )
+    ).json();
+    this.requireFields(response, ['comment'], 'Google Business review reply');
+    return { id: `${commentId}:reply` };
   }
 }

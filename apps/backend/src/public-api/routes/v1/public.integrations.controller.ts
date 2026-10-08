@@ -674,6 +674,40 @@ export class PublicIntegrationsController {
     );
   }
 
+  @Get('/integrations/:integration/comments')
+  async getAccountComments(
+    @GetOrgFromRequest() org: Organization,
+    @Param('integration') integration: string,
+    @Query('cursor') cursor?: string
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this.orNotAvailable(
+      await this._integrationService.accountComments(
+        org,
+        integration,
+        cursor || undefined
+      )
+    );
+  }
+
+  @Post('/integrations/:integration/comments/:commentId/reply')
+  async replyToAccountComment(
+    @GetOrgFromRequest() org: Organization,
+    @Param('integration') integration: string,
+    @Param('commentId') commentId: string,
+    @Body() body: ReplyCommentDto
+  ) {
+    Sentry.metrics.count('public_api-request', 1);
+    return this.orNotAvailable(
+      await this._integrationService.replyAccountComment(
+        org,
+        integration,
+        commentId,
+        body.message
+      )
+    );
+  }
+
   /** Null from the services means "not published" or "the platform has no such feature". */
   private orNotAvailable<T>(value: T | null): T {
     if (value === null) {

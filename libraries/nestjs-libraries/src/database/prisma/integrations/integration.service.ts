@@ -10,6 +10,7 @@ import { IntegrationManager } from '@gitroom/nestjs-libraries/integrations/integ
 import {
   AccountInsights,
   AnalyticsData,
+  CommentsPage,
   SocialProvider,
 } from '@gitroom/nestjs-libraries/integrations/social/social.integrations.interface';
 import { Integration, Organization } from '@prisma/client';
@@ -453,56 +454,26 @@ export class IntegrationService {
   async accountInsights(
     org: Organization,
     integration: string,
-    days: number,
-    forceRefresh = false
+    days: number
   ): Promise<AccountInsights | null> {
-    const getIntegration = await this.getIntegrationById(org.id, integration);
-    if (!getIntegration) {
-      throw new Error('Invalid integration');
-    }
-    if (getIntegration.type !== 'social') {
-      return null;
-    }
-
-    const integrationProvider = this._integrationManager.getSocialIntegration(
-      getIntegration.providerIdentifier
-    );
-    if (!integrationProvider.accountInsights) {
-      return null;
-    }
-
-    if (
-      dayjs(getIntegration.tokenExpiration).isBefore(dayjs()) ||
-      forceRefresh
-    ) {
-      const data = await this._refreshIntegrationService.refresh(
-        getIntegration
-      );
-      if (!data) {
-        return null;
-      }
-      if (!data.accessToken) {
-        await this.disconnectChannel(org.id, getIntegration);
-        return null;
-      }
-      getIntegration.token = data.accessToken;
-      if (integrationProvider.refreshWait) {
-        await timer(10000);
-      }
-    }
-
     const cacheKey = `insights:${org.id}:${integration}:${days}`;
     const cached = await ioRedis.get(cacheKey);
     if (cached) {
       return JSON.parse(cached);
     }
 
-    try {
-      const insights = await integrationProvider.accountInsights(
-        getIntegration.internalId,
-        getIntegration.token,
-        days
-      );
+    const insights = await this.withSocialIntegration(
+      org.id,
+      integration,
+      'accountInsights',
+      (provider, getIntegration) =>
+        provider.accountInsights?.(
+          getIntegration.internalId,
+          getIntegration.token,
+          days
+        )
+    );
+    if (insights) {
       await ioRedis.set(
         cacheKey,
         JSON.stringify(insights),
@@ -511,13 +482,110 @@ export class IntegrationService {
           ? 1
           : 3600
       );
-      return insights;
-    } catch (e) {
-      if (e instanceof RefreshToken && !forceRefresh) {
-        return this.accountInsights(org, integration, days, true);
-      }
-      throw e;
     }
+    return insights;
+  }
+
+  /** PhantomPulse: comments on the account itself (reviews), newest first. */
+  accountComments(
+    org: Organization,
+    integration: string,
+    cursor?: string
+  ): Promise<CommentsPage | null> {
+    return this.withSocialIntegration(
+      org.id,
+      integration,
+      'accountComments',
+      (provider, getIntegration) =>
+        provider.accountComments?.(
+          getIntegration.internalId,
+          getIntegration.token,
+          cursor
+        )
+    );
+  }
+
+  replyAccountComment(
+    org: Organization,
+    integration: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string } | null> {
+    return this.withSocialIntegration(
+      org.id,
+      integration,
+      'replyAccountComment',
+      (provider, getIntegration) =>
+        provider.replyAccountComment?.(
+          getIntegration.internalId,
+          getIntegration.token,
+          commentId,
+          message
+        )
+    );
+  }
+
+  /**
+   * Runs a provider call for a social channel with a usable token, refreshing
+   * it once if the platform asks - the same steps checkAnalytics takes. Null
+   * when the channel is not social, the provider has no such function, or the
+   * token cannot be refreshed.
+   */
+  private async withSocialIntegration<T>(
+    orgId: string,
+    integration: string,
+    method: keyof SocialProvider,
+    run: (
+      provider: SocialProvider,
+      integration: Integration
+    ) => Promise<T> | undefined
+  ): Promise<T | null> {
+    for (const forceRefresh of [false, true]) {
+      const getIntegration = await this.getIntegrationById(orgId, integration);
+      if (!getIntegration) {
+        throw new Error('Invalid integration');
+      }
+      if (getIntegration.type !== 'social') {
+        return null;
+      }
+
+      const provider = this._integrationManager.getSocialIntegration(
+        getIntegration.providerIdentifier
+      );
+      if (!provider[method]) {
+        return null;
+      }
+
+      if (
+        dayjs(getIntegration.tokenExpiration).isBefore(dayjs()) ||
+        forceRefresh
+      ) {
+        const data = await this._refreshIntegrationService.refresh(
+          getIntegration
+        );
+        if (!data) {
+          return null;
+        }
+        if (!data.accessToken) {
+          await this.disconnectChannel(orgId, getIntegration);
+          return null;
+        }
+        getIntegration.token = data.accessToken;
+        if (provider.refreshWait) {
+          await timer(10000);
+        }
+      }
+
+      try {
+        return (await run(provider, getIntegration)) ?? null;
+      } catch (e) {
+        if (e instanceof RefreshToken && !forceRefresh) {
+          continue;
+        }
+        throw e;
+      }
+    }
+    return null;
   }
 
   async checkAnalytics(

@@ -65,6 +65,19 @@ export interface IAuthenticator {
     commentId: string,
     hidden: boolean
   ): Promise<void>;
+  // Comments that belong to the account, not to one post (Google Business
+  // reviews). commentId is the platform's short id, safe in a URL path.
+  accountComments?(
+    id: string,
+    accessToken: string,
+    cursor?: string
+  ): Promise<CommentsPage>;
+  replyAccountComment?(
+    id: string,
+    accessToken: string,
+    commentId: string,
+    message: string
+  ): Promise<{ id: string }>;
   resolveReleaseId?(
     accessToken: string,
     releaseId: string,
@@ -128,6 +141,8 @@ export type SocialComment = {
   hidden: boolean;
   canReply: boolean;
   canHide: boolean;
+  // Star rating 1-5, only on reviews.
+  rating?: number;
 };
 
 export type CommentsPage = {
